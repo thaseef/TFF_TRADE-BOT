@@ -1,0 +1,286 @@
+import streamlit as st
+import pandas as pd
+import requests
+from streamlit_autorefresh import st_autorefresh
+import threading
+import time
+from datetime import datetime
+import pytz
+import os
+
+# -----------------------------
+# Page Configuration & Styling
+# -----------------------------
+st.set_page_config(
+    page_title="PRO 1H Terminal",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Auto-refresh UI every 30 seconds
+st_autorefresh(interval=30000, key="datarefresh")
+
+# -----------------------------
+# Configuration Variables
+# -----------------------------
+# FETCHING KEYS SECURELY FROM ENVIRONMENT
+TELEGRAM_TOKEN = os.getenv("8761349419:AAHbMQy2eCqQ9RjgSP99KXY-8fVJ0caVf7Y")
+TELEGRAM_CHAT_ID = os.getenv("7999641132")
+
+# Strict 1H 21/200 Strategy
+SHORT_EMA = 21
+LONG_EMA = 200
+BASE_URL = "https://data-api.binance.vision/api/v3/klines"
+
+# -----------------------------
+# Background Engine
+# -----------------------------
+class BackgroundScanner:
+    def __init__(self):
+        self.results_data = []
+        self.btc_mtfa = {"Price": "$0.00", "15m": "⚪ Scanning", "1H": "⚪ Scanning", "4H": "⚪ Scanning", "1D": "⚪ Scanning"}
+        self.last_update_time = "Booting Max Capacity Engine..."
+        self.alerted_candles = {}
+        self.is_running = True
+
+        thread = threading.Thread(target=self.scan_loop, daemon=True)
+        thread.start()
+
+    def get_top_usdt_pairs(self):
+        try:
+            url = "https://data-api.binance.vision/api/v3/ticker/24hr"
+            response = requests.get(url, timeout=10).json()
+            pairs = [d for d in response if d['symbol'].endswith('USDT')]
+            pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
+
+            # 🚀 MAX CAPACITY: SET TO 300 COINS 🚀
+            top_pairs = [d['symbol'] for d in pairs[:300]]
+            if "BTCUSDT" not in top_pairs: top_pairs.insert(0, "BTCUSDT")
+            return top_pairs
+        except:
+            return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+    def fetch_specific_rsi(self, symbol, interval):
+        try:
+            params = {"symbol": symbol, "interval": interval, "limit": 100}
+            resp = requests.get(BASE_URL, params=params, timeout=5).json()
+            close_prices = pd.Series([float(x[4]) for x in resp])
+            delta = close_prices.diff()
+            up = delta.clip(lower=0)
+            down = -1 * delta.clip(upper=0)
+            rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
+            return round(100 - (100 / (1 + rs)).iloc[-1], 2)
+        except:
+            return 50.0
+
+    def get_btc_trend(self, interval):
+        try:
+            params = {"symbol": "BTCUSDT", "interval": interval, "limit": 250}
+            resp = requests.get(BASE_URL, params=params, timeout=5).json()
+            close_prices = pd.Series([float(x[4]) for x in resp])
+
+            ema_21 = close_prices.ewm(span=SHORT_EMA, adjust=False).mean().iloc[-2]
+            ema_200 = close_prices.ewm(span=LONG_EMA, adjust=False).mean().iloc[-2]
+
+            if ema_21 > ema_200: return "🟢 UPTREND"
+            elif ema_21 < ema_200: return "🔴 DOWNTREND"
+            else: return "⚪ SIDEWAY"
+        except:
+            return "⚪ ERROR"
+
+    def send_telegram(self, coin, signal, trend, price, rsi_1h, rsi_4h, rsi_1d):
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+        
+        message = (
+            f"⚡ *1H CONFIRMED MACRO ALERT: {coin}* ⚡\n\n"
+            f"**Action:** {signal}\n"
+            f"**New Trend:** {trend}\n"
+            f"**Current Price:** ${price}\n\n"
+            f"📊 **Macro RSI Check:**\n"
+            f"• 1H: {rsi_1h}\n"
+            f"• 4H: {rsi_4h}\n"
+            f"• 1D: {rsi_1d}"
+        )
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=5)
+        except: pass
+
+    def scan_loop(self):
+        while self.is_running:
+            coins = self.get_top_usdt_pairs()
+            new_results = []
+
+            try:
+                price_resp = requests.get("https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT", timeout=5).json()
+                self.btc_mtfa["Price"] = f"${round(float(price_resp['price']), 2):,}"
+                self.btc_mtfa["15m"] = self.get_btc_trend("15m")
+                self.btc_mtfa["1H"] = self.get_btc_trend("1h")
+                self.btc_mtfa["4H"] = self.get_btc_trend("4h")
+                self.btc_mtfa["1D"] = self.get_btc_trend("1d")
+            except: pass
+
+            for symbol in coins:
+                try:
+                    params = {"symbol": symbol, "interval": "1h", "limit": 250}
+                    resp = requests.get(BASE_URL, params=params, timeout=5).json()
+                    df = pd.DataFrame(resp, columns=["open_time", "open", "high", "low", "close", "vol", "close_time", "qav", "not", "tbbv", "tbqv", "ig"])
+                    df["close"] = df["close"].astype(float)
+
+                    ema_short = df["close"].ewm(span=SHORT_EMA, adjust=False).mean()
+                    ema_long = df["close"].ewm(span=LONG_EMA, adjust=False).mean()
+
+                    prev_e_short, prev_e_long = ema_short.iloc[-3], ema_long.iloc[-3]
+                    curr_e_short, curr_e_long = ema_short.iloc[-2], ema_long.iloc[-2]
+
+                    price = df["close"].iloc[-1]
+                    closed_candle_time = df["close_time"].iloc[-2]
+
+                    rsi_15m, rsi_1h, rsi_4h, rsi_1d = "-", "-", "-", "-"
+                    sig = "⚪ Neutral"
+                    specific_trend = "⚪ SIDEWAY"
+
+                    is_cross = False
+
+                    if curr_e_short > curr_e_long:
+                        specific_trend = "🟢 UPTREND"
+                    elif curr_e_short < curr_e_long:
+                        specific_trend = "🔴 DOWNTREND"
+
+                    if prev_e_short <= prev_e_long and curr_e_short > curr_e_long:
+                        sig = "🚀 1H LONG CROSS"
+                        is_cross = True
+                    elif prev_e_short >= prev_e_long and curr_e_short < curr_e_long:
+                        sig = "🔻 1H SHORT CROSS"
+                        is_cross = True
+                    else:
+                        sig = specific_trend
+
+                    if is_cross:
+                        delta = df['close'].diff()
+                        up = delta.clip(lower=0)
+                        down = -1 * delta.clip(upper=0)
+                        rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
+                        rsi_1h = round((100 - (100 / (1 + rs))).iloc[-1], 2)
+
+                        rsi_15m = self.fetch_specific_rsi(symbol, "15m")
+                        rsi_4h = self.fetch_specific_rsi(symbol, "4h")
+                        rsi_1d = self.fetch_specific_rsi(symbol, "1d")
+
+                        if self.alerted_candles.get(symbol) != closed_candle_time:
+                            self.send_telegram(symbol, sig, specific_trend, round(price,6), rsi_1h, rsi_4h, rsi_1d)
+                            self.alerted_candles[symbol] = closed_candle_time
+
+                    new_results.append({
+                        "Asset": symbol,
+                        "Signal/Action": sig,
+                        "1H Trend": specific_trend if is_cross else "-",
+                        "Price": f"${round(price, 6)}",
+                        "15m RSI": rsi_15m,
+                        "1H RSI": rsi_1h,
+                        "4H RSI": rsi_4h,
+                        "1D RSI": rsi_1d
+                    })
+                except:
+                    pass
+
+            self.results_data = new_results
+            sl_timezone = pytz.timezone('Asia/Colombo')
+            self.last_update_time = datetime.now(sl_timezone).strftime("%I:%M:%S %p")
+
+            time.sleep(30)
+
+@st.cache_resource
+def get_scanner():
+    return BackgroundScanner()
+
+scanner_engine = get_scanner()
+
+# -----------------------------
+# Professional UI Construction
+# -----------------------------
+
+st.markdown("<h1 style='text-align: center; color: #4DA8DA;'>⚡ PRO 1H Command Center</h1>", unsafe_allow_html=True)
+st.markdown(f"<p style='text-align: center; color: gray;'>Last Server Sync: {scanner_engine.last_update_time} (SLST)</p>", unsafe_allow_html=True)
+st.markdown("---")
+
+# Sidebar
+st.sidebar.image("https://cryptologos.cc/logos/tether-usdt-logo.png", width=50)
+st.sidebar.markdown("## System Status")
+st.sidebar.success("✅ MAX 300 Engine Active")
+st.sidebar.info("🤖 1H Telegram Alerts Only")
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Active Algorithms")
+st.sidebar.markdown("1️⃣ **BTC Compass:** Multi-Timeframe Trend")
+st.sidebar.markdown("2️⃣ **Altcoins:** 1H 21/200 EMA Cross")
+st.sidebar.markdown("3️⃣ **Capacity:** Top 300 Pairs")
+
+if not scanner_engine.results_data:
+    st.warning("⏳ Booting Engine. Scanning 300 pairs. Please wait...")
+    st.progress(50)
+else:
+    # -----------------------------
+    # 👑 THE BITCOIN COMPASS BOX
+    # -----------------------------
+    st.markdown("### 👑 Bitcoin (BTC) Core Engine Status")
+    st.markdown(f"<h4 style='color: #B0BEC5;'>Current Price: {scanner_engine.btc_mtfa['Price']}</h4>", unsafe_allow_html=True)
+
+    btc_cols = st.columns(4)
+    def get_color(trend):
+        if "UP" in trend: return "#00e676"
+        if "DOWN" in trend: return "#ff4b4b"
+        return "#B0BEC5"
+
+    btc_cols[0].markdown(f"<div style='border:1px solid #333; padding:15px; border-radius:10px; text-align:center;'><b>15m Trend</b><br><span style='color:{get_color(scanner_engine.btc_mtfa['15m'])}; font-size:20px; font-weight:bold;'>{scanner_engine.btc_mtfa['15m']}</span></div>", unsafe_allow_html=True)
+    btc_cols[1].markdown(f"<div style='border:1px solid #333; padding:15px; border-radius:10px; text-align:center;'><b>1H Trend</b><br><span style='color:{get_color(scanner_engine.btc_mtfa['1H'])}; font-size:20px; font-weight:bold;'>{scanner_engine.btc_mtfa['1H']}</span></div>", unsafe_allow_html=True)
+    btc_cols[2].markdown(f"<div style='border:1px solid #333; padding:15px; border-radius:10px; text-align:center;'><b>4H Trend</b><br><span style='color:{get_color(scanner_engine.btc_mtfa['4H'])}; font-size:20px; font-weight:bold;'>{scanner_engine.btc_mtfa['4H']}</span></div>", unsafe_allow_html=True)
+    btc_cols[3].markdown(f"<div style='border:1px solid #333; padding:15px; border-radius:10px; text-align:center;'><b>1D Trend</b><br><span style='color:{get_color(scanner_engine.btc_mtfa['1D'])}; font-size:20px; font-weight:bold;'>{scanner_engine.btc_mtfa['1D']}</span></div>", unsafe_allow_html=True)
+
+    st.markdown("<br><br>", unsafe_allow_html=True)
+
+    # -----------------------------
+    # 🌍 ALTCOIN MARKET DATA
+    # -----------------------------
+    df_results = pd.DataFrame(scanner_engine.results_data)
+    df_altcoins = df_results[df_results['Asset'] != 'BTCUSDT'].copy()
+
+    active_crosses = df_altcoins[df_altcoins['Signal/Action'].str.contains("CROSS", na=False)]
+    bullish = df_altcoins[df_altcoins['Signal/Action'] == "🟢 UPTREND"]
+    bearish = df_altcoins[df_altcoins['Signal/Action'] == "🔴 DOWNTREND"]
+
+    st.markdown("### 🌐 Altcoin Market Radar")
+    col1, col2, col3 = st.columns(3)
+    with col1: st.metric("Monitored Altcoins", len(df_altcoins))
+    with col2: st.metric("🚨 CONFIRMED 1H SIGNALS", len(active_crosses), delta="EXECUTE" if len(active_crosses)>0 else "Watching", delta_color="inverse")
+    with col3: st.metric("Trending Altcoins", len(bullish) + len(bearish))
+    st.markdown("---")
+
+    if not active_crosses.empty:
+        st.error(f"### 🎯 CONFIRMED OPPORTUNITIES (RSI DATA UNLOCKED)")
+        def color_active_rsi(val):
+            if isinstance(val, (int, float)):
+                if val >= 70: return 'color: #ff4b4b; font-weight: bold'
+                if val <= 30: return 'color: #00e676; font-weight: bold'
+                return 'color: #B0BEC5; font-weight: bold'
+            return ''
+
+        styled_active = active_crosses.style.map(color_active_rsi, subset=['15m RSI', '1H RSI', '4H RSI', '1D RSI'])
+        st.dataframe(styled_active, use_container_width=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    def get_sort_priority(row):
+        if "CROSS" in row['Signal/Action']: return 1
+        if "UPTREND" in row['Signal/Action']: return 2
+        return 3
+
+    df_altcoins['Priority'] = df_altcoins.apply(get_sort_priority, axis=1)
+    df_altcoins = df_altcoins.sort_values(by=['Priority', 'Asset']).drop(columns=['Priority']).reset_index(drop=True)
+
+    def highlight_pro(val):
+        if isinstance(val, str):
+            if 'CROSS' in val: return 'background-color: #1e3a8a; color: white; font-weight: bold'
+            if val == '-': return 'color: #333333'
+        return ''
+
+    styled_df = df_altcoins.style.map(highlight_pro)
+    st.dataframe(styled_df, use_container_width=True, height=700)
