@@ -6,7 +6,6 @@ import threading
 import time
 from datetime import datetime
 import pytz
-import os
 
 # -----------------------------
 # Page Configuration & Styling
@@ -24,9 +23,9 @@ st_autorefresh(interval=30000, key="datarefresh")
 # -----------------------------
 # Configuration Variables
 # -----------------------------
-# FETCHING KEYS SECURELY FROM ENVIRONMENT
-TELEGRAM_TOKEN = os.getenv("8761349419:AAHbMQy2eCqQ9RjgSP99KXY-8fVJ0caVf7Y")
-TELEGRAM_CHAT_ID = os.getenv("7999641132")
+# THE FIX: Hardcoded strings instead of os.getenv
+TELEGRAM_TOKEN = "8761349419:AAHbMQy2eCqQ9RjgSP99KXY-8fVJ0caVf7Y"
+TELEGRAM_CHAT_ID = "7999641132"
 
 # Strict 1H 21/200 Strategy
 SHORT_EMA = 21
