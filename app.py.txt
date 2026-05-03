@@ -18,6 +18,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Dark Theme styling override for tables
+st.markdown("""
+    <style>
+    .stDataFrame {border: 1px solid #333; border-radius: 10px;}
+    </style>
+    """, unsafe_allow_html=True)
+
 st_autorefresh(interval=30000, key="datarefresh")
 
 # -----------------------------
@@ -103,37 +110,18 @@ class BackgroundScanner:
             return round(100 - (100 / (1 + rs)).iloc[-1], 2)
         except: return 50.0
 
-    def check_15m_pullback(self, symbol, signal_type):
-        """Checks the 15m timeframe for an optimal sniper entry (Pullback to EMA)"""
-        try:
-            params = {"symbol": symbol, "interval": "15m", "limit": 50}
-            resp = requests.get(BASE_URL, params=params, timeout=5).json()
-            df = pd.DataFrame(resp, columns=["open_time", "open", "high", "low", "close", "vol", "close_time", "qav", "not", "tbbv", "tbqv", "ig"])
-            df[["low", "high", "close"]] = df[["low", "high", "close"]].astype(float)
-            ema_21 = df["close"].ewm(span=21, adjust=False).mean().iloc[-1]
-            
-            curr_low = df["low"].iloc[-1]
-            curr_high = df["high"].iloc[-1]
-            
-            if signal_type == "LONG":
-                return curr_low <= (ema_21 * 1.002) # Within 0.2% of 21 EMA
-            else:
-                return curr_high >= (ema_21 * 0.998)
-        except: return False
-
     def calculate_rr(self, df, signal_type, entry_price):
-        """Calculates exact Stop Loss, Take Profit, and Risk-to-Reward Ratio"""
         try:
-            lookback = df.iloc[-10:-1] # Look back 10 candles for structure
+            lookback = df.iloc[-10:-1]
             if signal_type == "LONG":
-                sl = lookback['low'].min() * 0.998 # Just below recent swing low
+                sl = lookback['low'].min() * 0.998
                 risk = entry_price - sl
                 if risk <= 0: return 0, sl, 0
-                tp = entry_price + (risk * 2) # Target 1:2 RR
+                tp = entry_price + (risk * 2) 
                 rr = (tp - entry_price) / risk
                 return round(rr, 2), round(sl, 4), round(tp, 4)
             else:
-                sl = lookback['high'].max() * 1.002 # Just above recent swing high
+                sl = lookback['high'].max() * 1.002
                 risk = sl - entry_price
                 if risk <= 0: return 0, sl, 0
                 tp = entry_price - (risk * 2)
@@ -142,20 +130,15 @@ class BackgroundScanner:
         except: return 0, 0, 0
 
     def get_session_weight(self):
-        """Checks UTC time to determine if we are in high-liquidity trading hours"""
         utc_now = datetime.now(pytz.utc).time()
-        # London Session: 08:00 - 16:00 UTC
         london_start, london_end = dt_time(8, 0), dt_time(16, 0)
-        # NY Session: 13:00 - 21:00 UTC
         ny_start, ny_end = dt_time(13, 0), dt_time(21, 0)
-        
-        # Asian Dead Zone: roughly 00:00 - 06:00 UTC
         asian_start, asian_end = dt_time(0, 0), dt_time(6, 0)
 
         if (london_start <= utc_now <= london_end) or (ny_start <= utc_now <= ny_end):
-            return "🔥 HIGH (London/NY Open)", 15 # +15 Confidence Bonus
+            return "🔥 HIGH (London/NY Open)", 15 
         elif asian_start <= utc_now <= asian_end:
-            return "🧊 LOW (Asian Dead Zone)", -10 # -10 Confidence Penalty
+            return "🧊 LOW (Asian Dead Zone)", -10 
         else:
             return "⚪ NORMAL (Mid Session)", 0
 
@@ -238,7 +221,6 @@ class BackgroundScanner:
                         sig, is_cross = "🔻 1H SHORT CROSS", True
                     else: sig = specific_trend
 
-                    # EVENT-DRIVEN INSTITUTIONAL FILTERS
                     if is_cross:
                         adx_val = self.calculate_adx(df)
                         signal_type = "LONG" if "LONG" in sig else "SHORT"
@@ -250,26 +232,20 @@ class BackgroundScanner:
                         
                         rr, sl, tp = self.calculate_rr(df, signal_type, price)
                         session_name, session_weight = self.get_session_weight()
-                        
                         rsi_1h = self.fetch_rsi(symbol, "1h")
                         
-                        # Master Scoring Algorithm
-                        raw_conf = 30 # Base
+                        # Master Scoring Algorithm (Adjusted without Pullback)
+                        raw_conf = 45 # Slightly higher base
                         if adx_val > 25: raw_conf += 15
                         if adx_val < 20: raw_conf -= 40
                         if bos_status: raw_conf += 20
                         if "MASSIVE" in vol_status: raw_conf += 15
                         elif "Low Volume" in vol_status: raw_conf -= 20
-                        raw_conf += session_weight # Add/Subtract Session Liquidity Weight
-                        
-                        # 15m Sniper Pullback Check
-                        is_pullback = self.check_15m_pullback(symbol, signal_type)
-                        if is_pullback: raw_conf += 20
-                        else: raw_conf -= 10 # Penalize for chasing the pump
+                        raw_conf += session_weight 
 
                         conf = max(0, min(100, raw_conf))
 
-                        # THE FINAL GATEKEEPER: Only alert if Confidence >= 60% AND RR >= 1:2
+                        # Threshold Logic
                         if conf >= 60 and rr >= 2.0:
                             if self.alerted_candles.get(symbol) != closed_candle_time:
                                 self.send_telegram(symbol, sig, specific_trend, conf, adx_val, bos_status, rr, sl, tp, session_name, round(price,6), rsi_1h, vol_status)
@@ -303,7 +279,7 @@ st.markdown("---")
 st.sidebar.image("https://cryptologos.cc/logos/tether-usdt-logo.png", width=50)
 st.sidebar.success("✅ Smart Money Engine Active")
 st.sidebar.markdown("### Active Institutional Filters")
-st.sidebar.markdown("1️⃣ 15m Sniper Pullback (EMA)")
+st.sidebar.markdown("1️⃣ 1H Momentum Cross (EMA 21/200)")
 st.sidebar.markdown("2️⃣ 1:2 Minimum Risk-to-Reward")
 st.sidebar.markdown("3️⃣ Session Liquidity Weights")
 st.sidebar.markdown("4️⃣ ADX Regime & BOS Structure")
@@ -318,6 +294,7 @@ if not scanner_engine.results_data:
 else:
     df_alt = pd.DataFrame(scanner_engine.results_data)
     st.markdown("### 🌐 Market Activity (60% Conf. Minimum)")
+    
     def color_rows(val):
         if isinstance(val, str):
             if 'CROSS' in val: return 'background-color: #1e3a8a; color: white; font-weight: bold'
@@ -327,4 +304,5 @@ else:
                     return 'color: #00e676' if num >= 70 else 'color: #ff9800' if num >= 60 else 'color: #ff4b4b'
                 except: pass
         return ''
+    
     st.dataframe(df_alt.style.map(color_rows), use_container_width=True, height=600)
